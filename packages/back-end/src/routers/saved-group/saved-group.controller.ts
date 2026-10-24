@@ -1,0 +1,646 @@
+import type { Response } from "express";
+import { isEqual } from "lodash";
+import {
+  featuresReferencingSavedGroups,
+  experimentsReferencingSavedGroups,
+  formatByteSizeString,
+  SAVED_GROUP_SIZE_LIMIT_BYTES,
+  ID_LIST_DATATYPES,
+  validateCondition,
+} from "shared/util";
+import {
+  SavedGroupInterface,
+  CreateSavedGroupProps,
+  UpdateSavedGroupProps,
+} from "shared/types/saved-group";
+import { AuthRequest } from "back-end/src/types/AuthRequest";
+import { ApiErrorResponse } from "back-end/types/api";
+import { getContextFromReq } from "back-end/src/services/organizations";
+import { getAllFeatures } from "back-end/src/models/FeatureModel";
+import { getAllExperiments } from "back-end/src/models/ExperimentModel";
+
+// region POST /saved-groups
+
+type CreateSavedGroupRequest = AuthRequest<
+  CreateSavedGroupProps,
+  Record<string, never>,
+  { skipCycleCheck?: string }
+>;
+
+type CreateSavedGroupResponse = {
+  status: 200;
+  savedGroup: SavedGroupInterface;
+};
+
+/**
+ * POST /saved-groups
+ * Create a saved-group resource
+ * @param req
+ * @param res
+ */
+export const postSavedGroup = async (
+  req: CreateSavedGroupRequest,
+  res: Response<CreateSavedGroupResponse>,
+) => {
+  const context = getContextFromReq(req);
+  const { org, userId } = context;
+  const {
+    groupName,
+    owner,
+    attributeKey,
+    values,
+    type,
+    condition,
+    description,
+    projects,
+  } = req.body;
+  const skipCycleCheck = req.query.skipCycleCheck;
+
+  if (!context.permissions.canCreateSavedGroup({ ...req.body })) {
+    context.permissions.throwPermissionError();
+  }
+
+  if (projects) {
+    await context.models.projects.ensureProjectsExist(projects);
+  }
+
+  let uniqValues: string[] | undefined = undefined;
+  // If this is a condition group, make sure the condition is valid and not empty
+  if (type === "condition") {
+    const allSavedGroups = await context.models.savedGroups.getAll();
+    const groupMap = new Map(allSavedGroups.map((sg) => [sg.id, sg]));
+    const conditionRes = validateCondition(
+      condition,
+      groupMap,
+      skipCycleCheck === "1",
+    );
+    if (!conditionRes.success) {
+      throw new Error(conditionRes.error);
+    }
+    if (conditionRes.empty) {
+      throw new Error("Condition cannot be empty");
+    }
+  } else if (type === "list") {
+    // If this is a list group, make sure the attributeKey is specified
+    if (!attributeKey) {
+      throw new Error("Must specify an attributeKey");
+    }
+    const attributeSchema = org.settings?.attributeSchema || [];
+    const datatype = attributeSchema.find(
+      (sdkAttr) => sdkAttr.property === attributeKey,
+    )?.datatype;
+    if (!datatype) {
+      throw new Error("Unknown attributeKey");
+    }
+    if (!ID_LIST_DATATYPES.includes(datatype)) {
+      throw new Error(
+        "Cannot create an ID List for the given attribute key. Try using a Condition Group instead.",
+      );
+    }
+    uniqValues = [...new Set(values)];
+    // Check that the size is within the global limit as well as any limit imposed by the organization
+    validateListSize(
+      uniqValues,
+      org.settings?.savedGroupSizeLimit,
+      context.permissions.canBypassSavedGroupSizeLimit(projects),
+    );
+  }
+  if (typeof description === "string" && description.length > 100) {
+    throw new Error("Description must be at most 100 characters");
+  }
+
+  const savedGroup = await context.models.savedGroups.create({
+    values: uniqValues,
+    type,
+    condition,
+    groupName,
+    owner: owner || userId,
+    attributeKey,
+    description,
+    projects,
+  });
+
+  return res.status(200).json({
+    status: 200,
+    savedGroup,
+  });
+};
+
+// endregion POST /saved-groups
+
+// region GET /saved-groups/:id
+
+type GetSavedGroupRequest = AuthRequest<Record<string, never>, { id: string }>;
+
+type GetSavedGroupResponse = {
+  status: 200;
+  savedGroup: SavedGroupInterface;
+};
+
+/**
+ * GET /saved-groups/:id
+ * Fetch a saved-group resource
+ * @param req
+ * @param res
+ */
+export const getSavedGroup = async (
+  req: GetSavedGroupRequest,
+  res: Response<GetSavedGroupResponse>,
+) => {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+
+  if (!id) {
+    throw new Error("Must specify saved group id");
+  }
+
+  const savedGroup = await context.models.savedGroups.getById(id);
+
+  if (!savedGroup) {
+    throw new Error("Could not find saved group");
+  }
+
+  return res.status(200).json({
+    status: 200,
+    savedGroup,
+  });
+};
+
+// endregion GET /saved-groups/:id
+
+// region POST /saved-groups/:id/add-items
+
+type PostSavedGroupAddItemsRequest = AuthRequest<
+  { items: string[] },
+  { id: string }
+>;
+
+type PostSavedGroupAddItemsResponse = {
+  status: 200;
+};
+
+/**
+ * POST /saved-groups/:id/add-items
+ * Update one saved-group resource by adding the specified list of items
+ * @param req
+ * @param res
+ */
+export const postSavedGroupAddItems = async (
+  req: PostSavedGroupAddItemsRequest,
+  res: Response<PostSavedGroupAddItemsResponse | ApiErrorResponse>,
+) => {
+  const context = getContextFromReq(req);
+  const { org } = context;
+  const { id } = req.params;
+  const { items } = req.body;
+
+  if (!id) {
+    throw new Error("Must specify saved group id");
+  }
+
+  const savedGroup = await context.models.savedGroups.getById(id);
+
+  if (!savedGroup) {
+    throw new Error("Could not find saved group");
+  }
+
+  if (!context.permissions.canUpdateSavedGroup(savedGroup, savedGroup)) {
+    context.permissions.throwPermissionError();
+  }
+
+  if (savedGroup.type !== "list") {
+    throw new Error("Can only add items to ID list saved groups");
+  }
+
+  if (!items) {
+    throw new Error("Must specify items to add to group");
+  }
+
+  if (!Array.isArray(items)) {
+    throw new Error("Must provide a list of items to add");
+  }
+
+  const attributeSchema = org.settings?.attributeSchema || [];
+  const datatype = attributeSchema.find(
+    (sdkAttr) => sdkAttr.property === savedGroup.attributeKey,
+  )?.datatype;
+  if (!datatype) {
+    throw new Error("Unknown attributeKey");
+  }
+  if (!ID_LIST_DATATYPES.includes(datatype)) {
+    throw new Error(
+      "Cannot add items to this group. The attribute key's datatype is not supported.",
+    );
+  }
+  const newValues = [...new Set([...(savedGroup.values || []), ...items])];
+  // Check that the size is within the global limit as well as any limit imposed by the organization
+  validateListSize(
+    newValues,
+    org.settings?.savedGroupSizeLimit,
+    context.permissions.canBypassSavedGroupSizeLimit(savedGroup.projects),
+  );
+
+  await context.models.savedGroups.update(savedGroup, {
+    values: newValues,
+  });
+
+  return res.status(200).json({
+    status: 200,
+  });
+};
+
+// endregion POST /saved-groups/:id/add-items
+
+// region POST /saved-groups/:id/remove-items
+
+type PostSavedGroupRemoveItemsRequest = AuthRequest<
+  { items: string[] },
+  { id: string }
+>;
+
+type PostSavedGroupRemoveItemsResponse = {
+  status: 200;
+};
+
+/**
+ * POST /saved-groups/:id/remove-items
+ * Update one saved-group resource by removing the specified list of items
+ * @param req
+ * @param res
+ */
+export const postSavedGroupRemoveItems = async (
+  req: PostSavedGroupRemoveItemsRequest,
+  res: Response<PostSavedGroupRemoveItemsResponse | ApiErrorResponse>,
+) => {
+  const context = getContextFromReq(req);
+  const { org } = context;
+  const { id } = req.params;
+  const { items } = req.body;
+
+  if (!id) {
+    throw new Error("Must specify saved group id");
+  }
+
+  const savedGroup = await context.models.savedGroups.getById(id);
+
+  if (!savedGroup) {
+    throw new Error("Could not find saved group");
+  }
+
+  if (!context.permissions.canUpdateSavedGroup(savedGroup, savedGroup)) {
+    context.permissions.throwPermissionError();
+  }
+
+  if (savedGroup.type !== "list") {
+    throw new Error("Can only remove items from ID list saved groups");
+  }
+
+  if (!items) {
+    throw new Error("Must specify items to remove from group");
+  }
+
+  if (!Array.isArray(items)) {
+    throw new Error("Must provide a list of items to remove");
+  }
+
+  const attributeSchema = org.settings?.attributeSchema || [];
+  const datatype = attributeSchema.find(
+    (sdkAttr) => sdkAttr.property === savedGroup.attributeKey,
+  )?.datatype;
+  if (!datatype) {
+    throw new Error("Unknown attributeKey");
+  }
+  if (!ID_LIST_DATATYPES.includes(datatype)) {
+    throw new Error(
+      "Cannot remove items from this group. The attribute key's datatype is not supported.",
+    );
+  }
+  const toRemove = new Set(items);
+  const newValues = (savedGroup.values || []).filter(
+    (value) => !toRemove.has(value),
+  );
+  // Check that the size is within the global limit as well as any limit imposed by the organization
+  validateListSize(
+    newValues,
+    org.settings?.savedGroupSizeLimit,
+    context.permissions.canBypassSavedGroupSizeLimit(savedGroup.projects),
+  );
+  await context.models.savedGroups.update(savedGroup, {
+    values: newValues,
+  });
+
+  return res.status(200).json({
+    status: 200,
+  });
+};
+
+// endregion POST /saved-groups/:id/remove-items
+
+// region PUT /saved-groups/:id
+
+type PutSavedGroupRequest = AuthRequest<
+  UpdateSavedGroupProps,
+  { id: string },
+  { skipCycleCheck?: string }
+>;
+
+type PutSavedGroupResponse = {
+  status: 200;
+};
+
+/**
+ * PUT /saved-groups/:id
+ * Update one saved-group resource
+ * @param req
+ * @param res
+ */
+export const putSavedGroup = async (
+  req: PutSavedGroupRequest,
+  res: Response<PutSavedGroupResponse | ApiErrorResponse>,
+) => {
+  const context = getContextFromReq(req);
+  const { org } = context;
+  const { groupName, owner, values, condition, description, projects } =
+    req.body;
+  const skipCycleCheck = req.query.skipCycleCheck;
+  const { id } = req.params;
+
+  if (!id) {
+    throw new Error("Must specify saved group id");
+  }
+
+  const savedGroup = await context.models.savedGroups.getById(id);
+
+  if (!savedGroup) {
+    throw new Error("Could not find saved group");
+  }
+
+  if (!context.permissions.canUpdateSavedGroup(savedGroup, { ...req.body })) {
+    context.permissions.throwPermissionError();
+  }
+
+  const fieldsToUpdate: UpdateSavedGroupProps = {};
+
+  if (typeof groupName !== "undefined" && groupName !== savedGroup.groupName) {
+    fieldsToUpdate.groupName = groupName;
+  }
+  if (typeof owner !== "undefined" && owner !== savedGroup.owner) {
+    fieldsToUpdate.owner = owner;
+  }
+  if (
+    savedGroup.type === "list" &&
+    values &&
+    !isEqual(values, savedGroup.values)
+  ) {
+    fieldsToUpdate.values = values;
+    // Check that the size is within the global limit as well as any limit imposed by the organization
+    validateListSize(
+      values,
+      org.settings?.savedGroupSizeLimit,
+      context.permissions.canBypassSavedGroupSizeLimit(savedGroup.projects),
+    );
+  }
+  if (
+    savedGroup.type === "condition" &&
+    condition &&
+    condition !== savedGroup.condition
+  ) {
+    // Validate condition to make sure it's valid. When skipCycleCheck=1 (used by
+    // importers), still validate general JSON/syntax but skip saved-group
+    // cyclic/invalid reference checks so users can fix them later.
+    const allSavedGroups = await context.models.savedGroups.getAll();
+    const groupMap = new Map(allSavedGroups.map((sg) => [sg.id, sg]));
+    // Include the updated condition in the savedGroupsObj for validation
+    groupMap.set(savedGroup.id, {
+      ...savedGroup,
+      condition,
+    });
+    const conditionRes = validateCondition(
+      condition,
+      groupMap,
+      // When skipCycleCheck=1, skip only saved-group *cycle* checks while still
+      // enforcing JSON validity and other saved-group errors (unknown group,
+      // invalid nested condition, max depth).
+      skipCycleCheck === "1",
+    );
+    if (!conditionRes.success) {
+      throw new Error(conditionRes.error);
+    }
+    if (conditionRes.empty) {
+      throw new Error("Condition cannot be empty");
+    }
+
+    fieldsToUpdate.condition = condition;
+  }
+  if (description !== savedGroup.description) {
+    if (typeof description === "string" && description.length > 100) {
+      throw new Error("Description must be at most 100 characters");
+    }
+    fieldsToUpdate.description = description;
+  }
+  if (!isEqual(savedGroup.projects, projects)) {
+    if (projects) {
+      await context.models.projects.ensureProjectsExist(projects);
+    }
+    fieldsToUpdate.projects = projects;
+  }
+
+  // If there are no changes, return early
+  if (Object.keys(fieldsToUpdate).length === 0) {
+    return res.status(200).json({
+      status: 200,
+    });
+  }
+
+  await context.models.savedGroups.update(savedGroup, fieldsToUpdate);
+
+  return res.status(200).json({
+    status: 200,
+  });
+};
+
+// endregion PUT /saved-groups/:id
+
+// region DELETE /saved-groups/:id
+
+type DeleteSavedGroupRequest = AuthRequest<
+  Record<string, never>,
+  { id: string },
+  Record<string, never>
+>;
+
+type DeleteSavedGroupResponse =
+  | {
+      status: 200;
+    }
+  | {
+      status: number;
+      message: string;
+    };
+
+/**
+ * DELETE /saved-groups/:id
+ * Delete one saved-group resource by ID
+ * @param req
+ * @param res
+ */
+export const deleteSavedGroup = async (
+  req: DeleteSavedGroupRequest,
+  res: Response<DeleteSavedGroupResponse>,
+) => {
+  const { id } = req.params;
+  const context = getContextFromReq(req);
+
+  const { org } = context;
+
+  const savedGroup = await context.models.savedGroups.getById(id);
+
+  if (!savedGroup) {
+    res.status(403).json({
+      status: 404,
+      message: "Saved group not found",
+    });
+    return;
+  }
+
+  if (savedGroup.organization !== org.id) {
+    res.status(403).json({
+      status: 403,
+      message: "You do not have access to this saved group",
+    });
+    return;
+  }
+
+  if (!context.permissions.canDeleteSavedGroup(savedGroup)) {
+    context.permissions.throwPermissionError();
+  }
+
+  await context.models.savedGroups.delete(savedGroup);
+
+  res.status(200).json({
+    status: 200,
+  });
+};
+
+// endregion DELETE /saved-groups/:id
+
+// region GET /saved-groups/:id/references
+
+type SavedGroupReferencesResponse =
+  | {
+      status: 200;
+      features: { id: string; name: string; project?: string }[];
+      experiments: {
+        id: string;
+        name: string;
+        project?: string;
+        projects?: string[];
+      }[];
+      savedGroups: { id: string; groupName: string; projects?: string[] }[];
+    }
+  | { message: string };
+
+/**
+ * GET /saved-groups/:id/references
+ * Returns features, experiments, and saved groups that reference this saved group.
+ * Checks direct references plus one level of saved-group chaining (saved groups whose
+ * condition directly contains this group's ID, and features/experiments that reference those).
+ */
+export const getSavedGroupReferences = async (
+  req: AuthRequest<null, { id: string }>,
+  res: Response<SavedGroupReferencesResponse>,
+) => {
+  const { id } = req.params;
+  const context = getContextFromReq(req);
+
+  const allSavedGroups = await context.models.savedGroups.getAll();
+  const targetGroup = allSavedGroups.find((sg) => sg.id === id);
+  if (!targetGroup) {
+    res.status(404).json({ message: "Saved group not found" });
+    return;
+  }
+
+  // Saved groups whose condition string directly references this group (one level of chaining)
+  const savedGroupsReferencingTarget = allSavedGroups.filter(
+    (sg) => sg.id !== id && sg.condition?.includes(id),
+  );
+
+  const savedGroupsToCheck = [targetGroup, ...savedGroupsReferencingTarget];
+
+  const environments = context.org.settings?.environments || [];
+
+  const [allFeatures, allExperiments] = await Promise.all([
+    getAllFeatures(context, {}),
+    getAllExperiments(context, {}),
+  ]);
+
+  const featureRefMap = featuresReferencingSavedGroups({
+    savedGroups: savedGroupsToCheck,
+    features: allFeatures,
+    environments,
+  });
+
+  const experimentRefMap = experimentsReferencingSavedGroups({
+    savedGroups: savedGroupsToCheck,
+    experiments: allExperiments,
+  });
+
+  const featuresSet = new Map<
+    string,
+    { id: string; name: string; project?: string }
+  >();
+  const experimentsSet = new Map<
+    string,
+    { id: string; name: string; project?: string; projects?: string[] }
+  >();
+
+  for (const sg of savedGroupsToCheck) {
+    for (const f of featureRefMap[sg.id] ?? []) {
+      featuresSet.set(f.id, { id: f.id, name: f.id, project: f.project });
+    }
+    for (const e of experimentRefMap[sg.id] ?? []) {
+      experimentsSet.set(e.id, {
+        id: e.id,
+        name: e.name,
+        project: (e as { project?: string }).project,
+        projects: (e as { projects?: string[] }).projects,
+      });
+    }
+  }
+
+  return res.status(200).json({
+    status: 200,
+    features: Array.from(featuresSet.values()),
+    experiments: Array.from(experimentsSet.values()),
+    savedGroups: savedGroupsReferencingTarget.map((sg) => ({
+      id: sg.id,
+      groupName: sg.groupName,
+      projects: sg.projects,
+    })),
+  });
+};
+
+// endregion GET /saved-groups/:id/references
+
+export function validateListSize(
+  values: Array<unknown>,
+  savedGroupSizeLimit: number | undefined,
+  canBypassSizeLimit: boolean,
+) {
+  if (
+    savedGroupSizeLimit &&
+    values.length > savedGroupSizeLimit &&
+    !canBypassSizeLimit
+  ) {
+    throw new Error(
+      `Your organization has imposed a maximum list length of ${savedGroupSizeLimit}`,
+    );
+  }
+  if (new Blob([JSON.stringify(values)]).size > SAVED_GROUP_SIZE_LIMIT_BYTES) {
+    throw new Error(
+      `The maximum size for a list is ${formatByteSizeString(
+        SAVED_GROUP_SIZE_LIMIT_BYTES,
+      )}.`,
+    );
+  }
+}
